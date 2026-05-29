@@ -1,6 +1,13 @@
 @echo off
 setlocal
 
+REM Auto-elevate to Administrator if not already
+net session >nul 2>&1
+if %errorlevel% neq 0 (
+    powershell -Command "Start-Process '%~f0' -Verb RunAs"
+    exit /b
+)
+
 echo === GIS EPD Grabber — настройка автозапуска ===
 echo.
 
