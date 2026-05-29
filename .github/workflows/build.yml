@@ -1,0 +1,56 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install httpx==0.27.0 cryptography==42.0.8 pyinstaller==6.6.0
+
+      - name: Build EXE
+        run: |
+          pyinstaller `
+            --onefile `
+            --name GisEpdGrabber `
+            --console `
+            --hidden-import cryptography `
+            --hidden-import cryptography.hazmat.primitives.ciphers.aead `
+            grabber.py
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GisEpdGrabber-windows
+          path: dist/GisEpdGrabber.exe
+          retention-days: 30
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: "GIS EPD Grabber — latest build"
+          files: dist/GisEpdGrabber.exe
+          body: |
+            Автоматическая сборка Windows EXE.
+
+            **Установка:**
+            1. Скачайте `GisEpdGrabber.exe`
+            2. Скачайте `setup_scheduler.bat` из репозитория
+            3. Войдите в eopp.epd-portal.ru через Яндекс Браузер
+            4. Запустите `setup_scheduler.bat` от имени администратора
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

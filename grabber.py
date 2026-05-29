@@ -1,0 +1,383 @@
+"""
+GIS EPD Slot Grabber — Windows standalone
+Читает куки из браузера на Windows, бронирует слот в ГИС ЭПД.
+
+Поддерживаемые браузеры (в порядке приоритета):
+  1. Яндекс Браузер
+  2. Microsoft Edge
+  3. Google Chrome
+
+Запускать через Task Scheduler в 10:00 и 12:00 МСК.
+"""
+import sys
+import os
+import json
+import sqlite3
+import shutil
+import tempfile
+import logging
+import base64
+import struct
+from pathlib import Path
+from datetime import datetime
+
+import httpx
+
+# ---------- Logging ----------
+LOG_DIR = Path(os.environ.get("APPDATA", ".")) / "GisEpdGrabber"
+LOG_DIR.mkdir(exist_ok=True)
+LOG_FILE = LOG_DIR / "grabber.log"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s: %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+        logging.StreamHandler(),
+    ],
+)
+log = logging.getLogger(__name__)
+
+# ---------- Config ----------
+PORTAL = "https://eopp.epd-portal.ru"
+TELEGRAM_TOKEN = os.environ.get("GIS_TG_TOKEN", "")   # заполнить или задать переменную среды
+TELEGRAM_CHAT = os.environ.get("GIS_TG_CHAT", "")     # chat_id Анастасии
+
+# ---------- Telegram ----------
+def send_tg(text: str):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT:
+        log.warning("TG not configured (GIS_TG_TOKEN / GIS_TG_CHAT not set)")
+        return
+    try:
+        r = httpx.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT, "text": text},
+            timeout=10,
+        )
+        if r.status_code != 200:
+            log.warning(f"TG send failed: {r.status_code} {r.text[:100]}")
+    except Exception as e:
+        log.error(f"TG error: {e}")
+
+# ---------- Cookie extraction ----------
+def _get_yandex_path() -> Path | None:
+    local = Path(os.environ.get("LOCALAPPDATA", ""))
+    candidates = [
+        local / "Yandex" / "YandexBrowser" / "User Data" / "Default" / "Network" / "Cookies",
+        local / "Yandex" / "YandexBrowser" / "User Data" / "Default" / "Cookies",
+    ]
+    for p in candidates:
+        if p.exists():
+            return p
+    return None
+
+def _get_edge_path() -> Path | None:
+    local = Path(os.environ.get("LOCALAPPDATA", ""))
+    p = local / "Microsoft" / "Edge" / "User Data" / "Default" / "Network" / "Cookies"
+    if not p.exists():
+        p = local / "Microsoft" / "Edge" / "User Data" / "Default" / "Cookies"
+    return p if p.exists() else None
+
+def _get_chrome_path() -> Path | None:
+    local = Path(os.environ.get("LOCALAPPDATA", ""))
+    p = local / "Google" / "Chrome" / "User Data" / "Default" / "Network" / "Cookies"
+    if not p.exists():
+        p = local / "Google" / "Chrome" / "User Data" / "Default" / "Cookies"
+    return p if p.exists() else None
+
+def _get_decryption_key(local_state_dir: Path) -> bytes | None:
+    """Extract AES key from Local State (Chrome v80+ encryption)."""
+    ls = local_state_dir / "Local State"
+    if not ls.exists():
+        return None
+    try:
+        state = json.loads(ls.read_text(encoding="utf-8"))
+        key_b64 = state.get("os_crypt", {}).get("encrypted_key")
+        if not key_b64:
+            return None
+        key_encrypted = base64.b64decode(key_b64)
+        # First 5 bytes are 'DPAPI' prefix
+        key_encrypted = key_encrypted[5:]
+        # Decrypt with DPAPI
+        import ctypes
+        import ctypes.wintypes
+
+        class DATA_BLOB(ctypes.Structure):
+            _fields_ = [("cbData", ctypes.wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+        p = ctypes.create_string_buffer(key_encrypted)
+        blobin = DATA_BLOB(ctypes.sizeof(p), p)
+        blobout = DATA_BLOB()
+        ctypes.windll.crypt32.CryptUnprotectData(
+            ctypes.byref(blobin), None, None, None, None, 0, ctypes.byref(blobout)
+        )
+        ptr = ctypes.string_at(blobout.pbData, blobout.cbData)
+        ctypes.windll.kernel32.LocalFree(blobout.pbData)
+        return ptr
+    except Exception as e:
+        log.debug(f"Key extraction error: {e}")
+        return None
+
+def _decrypt_cookie_value(encrypted: bytes, key: bytes | None) -> str:
+    """Decrypt a cookie value (v10/v11 AES-GCM or DPAPI fallback)."""
+    if not encrypted:
+        return ""
+
+    # v10/v11 prefix = Chrome v80+ AES-256-GCM
+    if encrypted[:3] in (b"v10", b"v11"):
+        if not key:
+            return ""
+        try:
+            from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+            nonce = encrypted[3:15]
+            ciphertext = encrypted[15:]
+            return AESGCM(key).decrypt(nonce, ciphertext, None).decode("utf-8", errors="replace")
+        except Exception as e:
+            log.debug(f"AES decrypt error: {e}")
+            return ""
+
+    # DPAPI fallback (old Chrome / some profiles)
+    try:
+        import ctypes
+        import ctypes.wintypes
+
+        class DATA_BLOB(ctypes.Structure):
+            _fields_ = [("cbData", ctypes.wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+        p = ctypes.create_string_buffer(encrypted)
+        blobin = DATA_BLOB(ctypes.sizeof(p), p)
+        blobout = DATA_BLOB()
+        ctypes.windll.crypt32.CryptUnprotectData(
+            ctypes.byref(blobin), None, None, None, None, 0, ctypes.byref(blobout)
+        )
+        result = ctypes.string_at(blobout.pbData, blobout.cbData)
+        ctypes.windll.kernel32.LocalFree(blobout.pbData)
+        return result.decode("utf-8", errors="replace")
+    except Exception as e:
+        log.debug(f"DPAPI decrypt error: {e}")
+        return ""
+
+def get_cookies_for_domain(domain: str = ".eopp.epd-portal.ru") -> dict:
+    """
+    Read cookies for given domain from the first available browser.
+    Returns dict {name: value}.
+    """
+    # Find browser cookie file and local state dir
+    paths = [
+        (_get_yandex_path(), Path(os.environ.get("LOCALAPPDATA","")) / "Yandex" / "YandexBrowser" / "User Data"),
+        (_get_edge_path(),   Path(os.environ.get("LOCALAPPDATA","")) / "Microsoft" / "Edge" / "User Data"),
+        (_get_chrome_path(), Path(os.environ.get("LOCALAPPDATA","")) / "Google" / "Chrome" / "User Data"),
+    ]
+
+    for cookie_file, ls_dir in paths:
+        if not cookie_file:
+            continue
+        log.info(f"Reading cookies from: {cookie_file}")
+
+        key = _get_decryption_key(ls_dir)
+
+        # Copy to temp (browser might lock the file)
+        tmp = Path(tempfile.mktemp(suffix=".db"))
+        try:
+            shutil.copy2(cookie_file, tmp)
+            conn = sqlite3.connect(tmp)
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+
+            cur.execute("""
+                SELECT name, encrypted_value, value
+                FROM cookies
+                WHERE host_key LIKE ?
+                ORDER BY last_access_utc DESC
+            """, (f"%{domain.lstrip('.')}%",))
+
+            cookies = {}
+            for row in cur.fetchall():
+                name = row["name"]
+                raw = row["encrypted_value"] or b""
+                plain = row["value"] or ""
+
+                if raw:
+                    decrypted = _decrypt_cookie_value(raw, key)
+                    if decrypted:
+                        plain = decrypted
+
+                if name and plain:
+                    cookies[name] = plain
+
+            conn.close()
+
+            if cookies:
+                log.info(f"Found {len(cookies)} cookies: {list(cookies.keys())[:6]}")
+                return cookies
+        except Exception as e:
+            log.warning(f"Cookie read error for {cookie_file}: {e}")
+        finally:
+            try:
+                tmp.unlink()
+            except:
+                pass
+
+    log.error("No browser cookies found!")
+    return {}
+
+# ---------- Portal API ----------
+def _headers(cookies: dict) -> dict:
+    return {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "ru-RU,ru;q=0.9",
+        "Content-Type": "application/json",
+        "Origin": PORTAL,
+        "Referer": f"{PORTAL}/ru/reservations",
+    }
+
+def check_session(cookies: dict) -> dict | None:
+    """Returns user info or None if session expired."""
+    try:
+        r = httpx.get(
+            f"{PORTAL}/auth/Account/GetCurrentUser?isTso=false",
+            headers=_headers(cookies), cookies=cookies,
+            follow_redirects=False, timeout=15,
+        )
+        if r.status_code == 200:
+            try:
+                return r.json()
+            except:
+                return {"status": "ok"}
+        log.warning(f"GetCurrentUser → {r.status_code}")
+        return None
+    except Exception as e:
+        log.error(f"Session check error: {e}")
+        return None
+
+def search_reservations(cookies: dict) -> list | None:
+    """Returns list of reservations or None on auth error."""
+    try:
+        r = httpx.post(
+            f"{PORTAL}/reservations-api/v1/Search",
+            headers=_headers(cookies), cookies=cookies,
+            json={"commonParams": {"pageIndex": 0, "pageSize": 20}, "filters": {}},
+            follow_redirects=False, timeout=20,
+        )
+        if r.status_code == 200:
+            data = r.json()
+            return data.get("items", data) if isinstance(data, dict) else data
+        if r.status_code == 401:
+            return None
+        log.error(f"Search → {r.status_code}: {r.text[:150]}")
+        return []
+    except Exception as e:
+        log.error(f"Search error: {e}")
+        return []
+
+def reserve_checkpoint(reservation_id: str, cookies: dict) -> dict:
+    """Book a slot for given reservation. Returns {success, error?}."""
+    try:
+        r = httpx.post(
+            f"{PORTAL}/reservations-api/v1/ReserveCheckpoint",
+            params={"reservationId": reservation_id},
+            headers=_headers(cookies), cookies=cookies,
+            json={},
+            follow_redirects=False, timeout=20,
+        )
+        if r.status_code in (200, 201, 204):
+            return {"success": True}
+        if r.status_code == 401:
+            return {"success": False, "session_expired": True}
+
+        err = r.text[:200]
+        # Known error codes from portal JS
+        if "41102" in err:
+            return {"success": False, "error": "Все слоты заняты (41102)"}
+        if "41104" in err:
+            return {"success": False, "error": "Слоты не найдены (41104)"}
+        return {"success": False, "error": f"HTTP {r.status_code}: {err[:80]}"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+# ---------- Main logic ----------
+def run():
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    log.info(f"=== GIS EPD Slot Grabber started at {now} ===")
+
+    # 1. Get browser cookies
+    cookies = get_cookies_for_domain(".eopp.epd-portal.ru")
+    if not cookies:
+        msg = f"[{now}] Ошибка: куки браузера не найдены. Войдите в eopp.epd-portal.ru через Яндекс браузер."
+        log.error(msg)
+        send_tg(f"⚠️ ГИС ЭПД: {msg}")
+        return
+
+    # 2. Check session
+    user = check_session(cookies)
+    if user is None:
+        msg = f"[{now}] Сессия истекла. Войдите в eopp.epd-portal.ru заново."
+        log.error(msg)
+        send_tg(f"⚠️ ГИС ЭПД: {msg}")
+        return
+
+    name = user.get("fullName") or user.get("login") or "пользователь"
+    log.info(f"Session OK: {name}")
+
+    # 3. Get reservations
+    reservations = search_reservations(cookies)
+    if reservations is None:
+        msg = f"[{now}] Сессия истекла при поиске заявок."
+        log.error(msg)
+        send_tg(f"⚠️ ГИС ЭПД: {msg}")
+        return
+
+    log.info(f"Found {len(reservations)} reservation(s)")
+
+    if not reservations:
+        log.info("No active reservations — nothing to book")
+        return
+
+    # 4. Try to book slots
+    booked = []
+    errors = []
+
+    for item in reservations:
+        res_id = str(
+            item.get("id") or item.get("reservationRequestId") or
+            item.get("reservationId") or ""
+        )
+        if not res_id:
+            log.warning(f"Reservation missing ID: {list(item.keys())[:5]}")
+            continue
+
+        status = item.get("status")
+        log.info(f"Reservation {res_id} status={status}")
+
+        result = reserve_checkpoint(res_id, cookies)
+
+        if result["success"]:
+            booked.append(res_id)
+            log.info(f"✓ Slot booked for {res_id}")
+        elif result.get("session_expired"):
+            msg = f"[{now}] Сессия истекла при бронировании. Войдите в портал заново."
+            log.error(msg)
+            send_tg(f"⚠️ ГИС ЭПД: {msg}")
+            return
+        else:
+            err = result.get("error", "неизвестная ошибка")
+            errors.append(f"{res_id}: {err}")
+            log.warning(f"✗ {res_id}: {err}")
+
+    # 5. Report
+    if booked:
+        msg = f"✅ ГИС ЭПД [{now}]: забронировано {len(booked)} слот(ов).\nЗаявки: {', '.join(booked)}"
+        log.info(msg)
+        send_tg(msg)
+    elif errors:
+        msg = f"❌ ГИС ЭПД [{now}]: не удалось забронировать.\n" + "\n".join(errors[:5])
+        log.error(msg)
+        send_tg(msg)
+    else:
+        log.info("No bookable reservations found")
+
+    log.info("=== Done ===")
+
+if __name__ == "__main__":
+    run()
