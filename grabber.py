@@ -124,39 +124,61 @@ def _get_decryption_key(local_state_dir: Path) -> bytes | None:
         log.warning(f"Key extraction error: {e}")
         return None
 
-def _decrypt_cookie_value(encrypted: bytes, key: bytes | None, name: str = "") -> str:
+def _bytes_to_str(data: bytes, name: str, source: str) -> str:
+    """Decode bytes to str: try UTF-8, fallback latin-1. AES-GCM tag already verified."""
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        val = data.decode("latin-1")
+        log.info(f"Cookie '{name}': {source} ok, latin-1 fallback len={len(val)} hex_preview={data[:16].hex()}")
+        return val
+
+
+def _decrypt_cookie_value(encrypted: bytes, key: bytes | None, name: str = "", _portal_diag: bool = False) -> str:
     """Decrypt a cookie value (v10/v11 AES-GCM or DPAPI fallback)."""
     if not encrypted:
         return ""
 
     prefix = encrypted[:3]
+
+    if _portal_diag:
+        log.info(f"DIAG cookie '{name}': total_len={len(encrypted)} prefix_hex={encrypted[:8].hex()}")
+
+    # v20 = Chrome 127+ App-Bound Encryption (IElevator COM, cannot decrypt without elevation)
+    if encrypted[:3] == b"v20" or (len(encrypted) > 3 and encrypted[3:6] == b"v20"):
+        log.warning(f"Cookie '{name}': v20 App-Bound Encryption detected — cannot decrypt without elevation service")
+        return ""
+
     # v10/v11 prefix = Chrome v80+ AES-256-GCM
     if prefix in (b"v10", b"v11"):
         if not key:
             log.info(f"Cookie '{name}': v10/v11 prefix but no AES key")
             return ""
-        try:
-            from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-            nonce = encrypted[3:15]
-            ciphertext = encrypted[15:]
-            plaintext = AESGCM(key).decrypt(nonce, ciphertext, None)
+        # Try nonce at standard offset 3, then offset 4 (some Yandex builds add 1 extra byte)
+        for nonce_start in (3, 4):
             try:
-                val = plaintext.decode("utf-8")
-                if '�' in val:
-                    log.warning(f"Cookie '{name}': AES-GCM ok but value has replacement chars (bad key?)")
-                    return ""
+                from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+                nonce = encrypted[nonce_start:nonce_start + 12]
+                ciphertext = encrypted[nonce_start + 12:]
+                if len(ciphertext) < 17:
+                    continue
+                plaintext = AESGCM(key).decrypt(nonce, ciphertext, None)
+                # AES-GCM tag verified → data is authentic, decode and return
+                val = _bytes_to_str(plaintext, name, f"AES-GCM(offset={nonce_start})")
+                if _portal_diag:
+                    log.info(f"DIAG cookie '{name}': plaintext_hex={plaintext[:24].hex()} val_preview={val[:40]!r}")
                 return val
-            except UnicodeDecodeError:
-                log.warning(f"Cookie '{name}': AES-GCM ok but UTF-8 decode failed len={len(plaintext)}")
-                return ""
-        except Exception as e:
-            log.info(f"Cookie '{name}': AES decrypt error: {e}")
-            return ""
+            except Exception as e:
+                if _portal_diag:
+                    log.info(f"DIAG cookie '{name}': AES-GCM nonce_start={nonce_start} → {e}")
+                continue
+        log.info(f"Cookie '{name}': all AES-GCM offsets failed, trying DPAPI")
 
-    # Unknown prefix — log for diagnostics
-    log.info(f"Cookie '{name}': unknown prefix {encrypted[:4]!r} len={len(encrypted)}, trying DPAPI")
+    else:
+        # Unknown prefix — log for diagnostics
+        log.info(f"Cookie '{name}': unknown prefix {encrypted[:4]!r} len={len(encrypted)}, trying DPAPI")
 
-    # DPAPI fallback (old Chrome / some profiles)
+    # DPAPI fallback (old Chrome / unencrypted / v10 fallback)
     try:
         import ctypes
         import ctypes.wintypes
@@ -175,15 +197,10 @@ def _decrypt_cookie_value(encrypted: bytes, key: bytes | None, name: str = "") -
             return ""
         result = ctypes.string_at(blobout.pbData, blobout.cbData)
         ctypes.windll.kernel32.LocalFree(blobout.pbData)
-        try:
-            val = result.decode("utf-8")
-            if '�' in val:
-                log.warning(f"Cookie '{name}': DPAPI produced replacement chars (not DPAPI data?)")
-                return ""
-            return val
-        except UnicodeDecodeError:
-            log.warning(f"Cookie '{name}': DPAPI ok but UTF-8 decode failed len={len(result)}")
-            return ""
+        val = _bytes_to_str(result, name, "DPAPI")
+        if _portal_diag:
+            log.info(f"DIAG cookie '{name}': DPAPI ok plaintext_hex={result[:24].hex()} val_preview={val[:40]!r}")
+        return val
     except Exception as e:
         log.debug(f"DPAPI decrypt error: {e}")
         return ""
@@ -271,15 +288,19 @@ def get_cookies_for_domain(domain: str = ".eopp.epd-portal.ru") -> dict:
             """, (narrow, wide))
 
             cookies = {}
-            for row in cur.fetchall():
+            rows = cur.fetchall()
+            log.info(f"Portal cookie rows found: {len(rows)}")
+            for row in rows:
                 name = row["name"]
                 raw = row["encrypted_value"] or b""
                 plain = row["value"] or ""
 
                 if raw:
-                    decrypted = _decrypt_cookie_value(raw, key, name)
+                    decrypted = _decrypt_cookie_value(raw, key, name, _portal_diag=True)
                     if decrypted:
                         plain = decrypted
+                    else:
+                        log.warning(f"Cookie '{name}' (host={row['host_key']}): decryption returned empty, raw_len={len(raw)} raw_hex={raw[:20].hex()}")
 
                 if name and plain:
                     cookies[name] = plain
