@@ -158,29 +158,34 @@ def _decrypt_cookie_value(encrypted: bytes, key: bytes | None) -> str:
         return ""
 
 def _win_copy_locked(src: Path, dst: Path) -> bool:
-    """Copy a file that may be locked by a browser using Win32 sharing flags."""
+    """Copy a file locked by a browser using Win32 sharing flags (64-bit safe)."""
     try:
         import ctypes
         import ctypes.wintypes
-        GENERIC_READ = 0x80000000
+        k32 = ctypes.windll.kernel32
+        GENERIC_READ  = 0x80000000
         FILE_SHARE_ALL = 0x00000007
-        OPEN_EXISTING = 3
-        handle = ctypes.windll.kernel32.CreateFileW(
-            str(src), GENERIC_READ, FILE_SHARE_ALL, None, OPEN_EXISTING, 0, None
-        )
-        if handle == ctypes.c_void_p(-1).value:
+        OPEN_EXISTING  = 3
+        INVALID_HANDLE = ctypes.c_void_p(-1).value
+        k32.CreateFileW.restype = ctypes.wintypes.HANDLE
+        handle = k32.CreateFileW(str(src), GENERIC_READ, FILE_SHARE_ALL, None, OPEN_EXISTING, 0, None)
+        if handle is None or handle == INVALID_HANDLE:
+            log.debug(f"_win_copy_locked: CreateFileW failed err={k32.GetLastError()}")
             return False
         try:
             size_hi = ctypes.wintypes.DWORD(0)
-            size_lo = ctypes.windll.kernel32.GetFileSize(handle, ctypes.byref(size_hi))
+            k32.GetFileSize.restype = ctypes.wintypes.DWORD
+            size_lo = k32.GetFileSize(handle, ctypes.byref(size_hi))
             size = (size_hi.value << 32) | size_lo
+            if size == 0:
+                return False
             buf = ctypes.create_string_buffer(size)
             read = ctypes.wintypes.DWORD(0)
-            ctypes.windll.kernel32.ReadFile(handle, buf, size, ctypes.byref(read), None)
+            k32.ReadFile(handle, buf, size, ctypes.byref(read), None)
             dst.write_bytes(buf.raw[: read.value])
             return read.value > 0
         finally:
-            ctypes.windll.kernel32.CloseHandle(handle)
+            k32.CloseHandle(handle)
     except Exception as e:
         log.debug(f"_win_copy_locked failed: {e}")
         return False
