@@ -163,14 +163,21 @@ def _win_copy_locked(src: Path, dst: Path) -> bool:
         import ctypes
         import ctypes.wintypes
         k32 = ctypes.windll.kernel32
-        GENERIC_READ  = 0x80000000
+        GENERIC_READ   = 0x80000000
+        FILE_SHARE_READ  = 0x00000001
+        FILE_SHARE_WRITE = 0x00000002
         FILE_SHARE_ALL = 0x00000007
         OPEN_EXISTING  = 3
         INVALID_HANDLE = ctypes.c_void_p(-1).value
         k32.CreateFileW.restype = ctypes.wintypes.HANDLE
-        handle = k32.CreateFileW(str(src), GENERIC_READ, FILE_SHARE_ALL, None, OPEN_EXISTING, 0, None)
-        if handle is None or handle == INVALID_HANDLE:
-            log.debug(f"_win_copy_locked: CreateFileW failed err={k32.GetLastError()}")
+        # First try with FILE_SHARE_READ|WRITE (Chrome standard), then full ALL
+        for share_flags in (FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_SHARE_ALL):
+            handle = k32.CreateFileW(str(src), GENERIC_READ, share_flags, None, OPEN_EXISTING, 0, None)
+            if handle is not None and handle != INVALID_HANDLE:
+                break
+            log.info(f"_win_copy_locked: share=0x{share_flags:x} err={k32.GetLastError()} file={src.name}")
+        else:
+            log.warning(f"_win_copy_locked: all share modes failed err={k32.GetLastError()} for {src.name}")
             return False
         try:
             size_hi = ctypes.wintypes.DWORD(0)
@@ -178,16 +185,18 @@ def _win_copy_locked(src: Path, dst: Path) -> bool:
             size_lo = k32.GetFileSize(handle, ctypes.byref(size_hi))
             size = (size_hi.value << 32) | size_lo
             if size == 0:
+                log.warning(f"_win_copy_locked: file size=0 for {src.name}")
                 return False
             buf = ctypes.create_string_buffer(size)
             read = ctypes.wintypes.DWORD(0)
-            k32.ReadFile(handle, buf, size, ctypes.byref(read), None)
+            ok = k32.ReadFile(handle, buf, size, ctypes.byref(read), None)
+            log.info(f"_win_copy_locked: ReadFile ok={ok} read={read.value} size={size} file={src.name}")
             dst.write_bytes(buf.raw[: read.value])
             return read.value > 0
         finally:
             k32.CloseHandle(handle)
     except Exception as e:
-        log.debug(f"_win_copy_locked failed: {e}")
+        log.warning(f"_win_copy_locked failed: {e}")
         return False
 
 
@@ -219,12 +228,16 @@ def get_cookies_for_domain(domain: str = ".eopp.epd-portal.ru") -> dict:
             conn.row_factory = sqlite3.Row
             cur = conn.cursor()
 
+            # Search by subdomain first, then by parent domain (portal may set .epd-portal.ru cookies)
+            narrow = f"%{domain.lstrip('.')}%"
+            wide = "%epd-portal.ru%"
+
             cur.execute("""
-                SELECT name, encrypted_value, value
+                SELECT name, encrypted_value, value, host_key
                 FROM cookies
-                WHERE host_key LIKE ?
+                WHERE host_key LIKE ? OR host_key LIKE ?
                 ORDER BY last_access_utc DESC
-            """, (f"%{domain.lstrip('.')}%",))
+            """, (narrow, wide))
 
             cookies = {}
             for row in cur.fetchall():
@@ -245,6 +258,17 @@ def get_cookies_for_domain(domain: str = ".eopp.epd-portal.ru") -> dict:
             if cookies:
                 log.info(f"Found {len(cookies)} cookies: {list(cookies.keys())[:6]}")
                 return cookies
+
+            # Debug: show what domains ARE in this browser's cookie db
+            try:
+                conn2 = sqlite3.connect(str(tmp))
+                cur2 = conn2.cursor()
+                cur2.execute("SELECT DISTINCT host_key FROM cookies ORDER BY last_access_utc DESC LIMIT 30")
+                all_hosts = [r[0] for r in cur2.fetchall()]
+                conn2.close()
+                log.info(f"No portal cookies. Recent host_keys in this browser: {all_hosts}")
+            except Exception as dbg_err:
+                log.debug(f"Debug host_keys failed: {dbg_err}")
         except Exception as e:
             log.warning(f"Cookie read error for {cookie_file}: {e}")
         finally:
