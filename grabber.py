@@ -97,29 +97,48 @@ def _get_decryption_key(local_state_dir: Path) -> bytes | None:
         if not key_b64:
             log.warning("os_crypt.encrypted_key not found in Local State")
             return None
-        key_encrypted = base64.b64decode(key_b64)
-        # First 5 bytes are 'DPAPI' prefix
-        key_encrypted = key_encrypted[5:]
-        # Decrypt with DPAPI
+        key_encrypted_full = base64.b64decode(key_b64)
+        log.info(f"os_crypt key: total_len={len(key_encrypted_full)} prefix5={key_encrypted_full[:5]!r} prefix8_hex={key_encrypted_full[:8].hex()}")
+
         import ctypes
         import ctypes.wintypes
 
         class DATA_BLOB(ctypes.Structure):
             _fields_ = [("cbData", ctypes.wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
 
-        p = ctypes.create_string_buffer(key_encrypted)
-        blobin = DATA_BLOB(ctypes.sizeof(p), p)
-        blobout = DATA_BLOB()
-        ok = ctypes.windll.crypt32.CryptUnprotectData(
-            ctypes.byref(blobin), None, None, None, None, 0, ctypes.byref(blobout)
-        )
-        if not ok or blobout.cbData == 0:
-            log.warning(f"CryptUnprotectData failed for AES key (ok={ok} cbData={blobout.cbData})")
-            return None
-        ptr = ctypes.string_at(blobout.pbData, blobout.cbData)
-        ctypes.windll.kernel32.LocalFree(blobout.pbData)
-        log.info(f"AES master key extracted OK: {len(ptr)} bytes")
-        return ptr
+        def _dpapi_decrypt(blob: bytes):
+            p = ctypes.create_string_buffer(blob)
+            blobin = DATA_BLOB(ctypes.sizeof(p), p)
+            blobout = DATA_BLOB()
+            ok = ctypes.windll.crypt32.CryptUnprotectData(
+                ctypes.byref(blobin), None, None, None, None, 0, ctypes.byref(blobout)
+            )
+            if not ok or blobout.cbData == 0:
+                return None
+            result = ctypes.string_at(blobout.pbData, blobout.cbData)
+            ctypes.windll.kernel32.LocalFree(blobout.pbData)
+            return result
+
+        # Try stripping different prefix lengths: Chrome uses 5 ("DPAPI"), Yandex may differ.
+        # Prefer the one that gives exactly 32 bytes (AES-256 key size).
+        best_key = None
+        for strip in (5, 4, 6, 8, 0):
+            blob = key_encrypted_full[strip:]
+            result = _dpapi_decrypt(blob)
+            if result is not None:
+                log.info(f"DPAPI ok: strip={strip} → {len(result)} bytes, hex_preview={result[:8].hex()}")
+                if len(result) == 32:
+                    if best_key is None:
+                        best_key = result
+                        log.info(f"AES master key extracted OK: 32 bytes (strip={strip})")
+                else:
+                    log.info(f"DPAPI strip={strip}: unexpected key size {len(result)}, ignoring")
+            else:
+                log.info(f"DPAPI strip={strip}: failed")
+
+        if best_key is None:
+            log.warning("All DPAPI strip attempts failed or returned non-32-byte key")
+        return best_key
     except Exception as e:
         log.warning(f"Key extraction error: {e}")
         return None
@@ -308,8 +327,19 @@ def get_cookies_for_domain(domain: str = ".eopp.epd-portal.ru") -> dict:
             conn.close()
 
             if cookies:
-                log.info(f"Found {len(cookies)} cookies: {list(cookies.keys())[:6]}")
-                return cookies
+                # Filter out non-ASCII values — httpx requires ASCII in Cookie header.
+                # Non-ASCII cookies (e.g. 'fio' with Cyrillic name) are display-only and break httpx.
+                # Auth cookies (session tokens, JWTs, GUIDs) are always ASCII.
+                http_cookies = {}
+                for k, v in cookies.items():
+                    if v.isascii():
+                        http_cookies[k] = v
+                    else:
+                        log.info(f"Cookie '{k}': non-ASCII value (Cyrillic/binary display data?), skipping for HTTP. hex={v.encode('latin-1', errors='replace')[:16].hex()}")
+                if http_cookies:
+                    log.info(f"Found {len(http_cookies)} HTTP-usable cookies: {list(http_cookies.keys())[:6]}")
+                    return http_cookies
+                log.warning(f"Found {len(cookies)} cookies but ALL are non-ASCII — no HTTP-usable cookies")
 
             # Debug: show what domains ARE in this browser's cookie db
             try:
