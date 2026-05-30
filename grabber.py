@@ -157,6 +157,35 @@ def _decrypt_cookie_value(encrypted: bytes, key: bytes | None) -> str:
         log.debug(f"DPAPI decrypt error: {e}")
         return ""
 
+def _win_copy_locked(src: Path, dst: Path) -> bool:
+    """Copy a file that may be locked by a browser using Win32 sharing flags."""
+    try:
+        import ctypes
+        import ctypes.wintypes
+        GENERIC_READ = 0x80000000
+        FILE_SHARE_ALL = 0x00000007
+        OPEN_EXISTING = 3
+        handle = ctypes.windll.kernel32.CreateFileW(
+            str(src), GENERIC_READ, FILE_SHARE_ALL, None, OPEN_EXISTING, 0, None
+        )
+        if handle == ctypes.c_void_p(-1).value:
+            return False
+        try:
+            size_hi = ctypes.wintypes.DWORD(0)
+            size_lo = ctypes.windll.kernel32.GetFileSize(handle, ctypes.byref(size_hi))
+            size = (size_hi.value << 32) | size_lo
+            buf = ctypes.create_string_buffer(size)
+            read = ctypes.wintypes.DWORD(0)
+            ctypes.windll.kernel32.ReadFile(handle, buf, size, ctypes.byref(read), None)
+            dst.write_bytes(buf.raw[: read.value])
+            return read.value > 0
+        finally:
+            ctypes.windll.kernel32.CloseHandle(handle)
+    except Exception as e:
+        log.debug(f"_win_copy_locked failed: {e}")
+        return False
+
+
 def get_cookies_for_domain(domain: str = ".eopp.epd-portal.ru") -> dict:
     """
     Read cookies for given domain from the first available browser.
@@ -176,10 +205,11 @@ def get_cookies_for_domain(domain: str = ".eopp.epd-portal.ru") -> dict:
 
         key = _get_decryption_key(ls_dir)
 
-        # Copy to temp (browser might lock the file)
+        # Copy to temp (browser locks the file while open — use Win32 sharing flags)
         tmp = Path(tempfile.mktemp(suffix=".db"))
         try:
-            shutil.copy2(cookie_file, tmp)
+            if not _win_copy_locked(cookie_file, tmp):
+                shutil.copy2(cookie_file, tmp)
             conn = sqlite3.connect(tmp)
             conn.row_factory = sqlite3.Row
             cur = conn.cursor()
