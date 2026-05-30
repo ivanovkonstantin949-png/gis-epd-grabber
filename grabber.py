@@ -88,12 +88,14 @@ def _get_chrome_path() -> Path | None:
 def _get_decryption_key(local_state_dir: Path) -> bytes | None:
     """Extract AES key from Local State (Chrome v80+ encryption)."""
     ls = local_state_dir / "Local State"
+    log.info(f"Local State: {ls} exists={ls.exists()}")
     if not ls.exists():
         return None
     try:
         state = json.loads(ls.read_text(encoding="utf-8"))
         key_b64 = state.get("os_crypt", {}).get("encrypted_key")
         if not key_b64:
+            log.warning("os_crypt.encrypted_key not found in Local State")
             return None
         key_encrypted = base64.b64decode(key_b64)
         # First 5 bytes are 'DPAPI' prefix
@@ -108,33 +110,51 @@ def _get_decryption_key(local_state_dir: Path) -> bytes | None:
         p = ctypes.create_string_buffer(key_encrypted)
         blobin = DATA_BLOB(ctypes.sizeof(p), p)
         blobout = DATA_BLOB()
-        ctypes.windll.crypt32.CryptUnprotectData(
+        ok = ctypes.windll.crypt32.CryptUnprotectData(
             ctypes.byref(blobin), None, None, None, None, 0, ctypes.byref(blobout)
         )
+        if not ok or blobout.cbData == 0:
+            log.warning(f"CryptUnprotectData failed for AES key (ok={ok} cbData={blobout.cbData})")
+            return None
         ptr = ctypes.string_at(blobout.pbData, blobout.cbData)
         ctypes.windll.kernel32.LocalFree(blobout.pbData)
+        log.info(f"AES master key extracted OK: {len(ptr)} bytes")
         return ptr
     except Exception as e:
-        log.debug(f"Key extraction error: {e}")
+        log.warning(f"Key extraction error: {e}")
         return None
 
-def _decrypt_cookie_value(encrypted: bytes, key: bytes | None) -> str:
+def _decrypt_cookie_value(encrypted: bytes, key: bytes | None, name: str = "") -> str:
     """Decrypt a cookie value (v10/v11 AES-GCM or DPAPI fallback)."""
     if not encrypted:
         return ""
 
+    prefix = encrypted[:3]
     # v10/v11 prefix = Chrome v80+ AES-256-GCM
-    if encrypted[:3] in (b"v10", b"v11"):
+    if prefix in (b"v10", b"v11"):
         if not key:
+            log.info(f"Cookie '{name}': v10/v11 prefix but no AES key")
             return ""
         try:
             from cryptography.hazmat.primitives.ciphers.aead import AESGCM
             nonce = encrypted[3:15]
             ciphertext = encrypted[15:]
-            return AESGCM(key).decrypt(nonce, ciphertext, None).decode("utf-8", errors="replace")
+            plaintext = AESGCM(key).decrypt(nonce, ciphertext, None)
+            try:
+                val = plaintext.decode("utf-8")
+                if '�' in val:
+                    log.warning(f"Cookie '{name}': AES-GCM ok but value has replacement chars (bad key?)")
+                    return ""
+                return val
+            except UnicodeDecodeError:
+                log.warning(f"Cookie '{name}': AES-GCM ok but UTF-8 decode failed len={len(plaintext)}")
+                return ""
         except Exception as e:
-            log.debug(f"AES decrypt error: {e}")
+            log.info(f"Cookie '{name}': AES decrypt error: {e}")
             return ""
+
+    # Unknown prefix — log for diagnostics
+    log.info(f"Cookie '{name}': unknown prefix {encrypted[:4]!r} len={len(encrypted)}, trying DPAPI")
 
     # DPAPI fallback (old Chrome / some profiles)
     try:
@@ -147,12 +167,23 @@ def _decrypt_cookie_value(encrypted: bytes, key: bytes | None) -> str:
         p = ctypes.create_string_buffer(encrypted)
         blobin = DATA_BLOB(ctypes.sizeof(p), p)
         blobout = DATA_BLOB()
-        ctypes.windll.crypt32.CryptUnprotectData(
+        ok = ctypes.windll.crypt32.CryptUnprotectData(
             ctypes.byref(blobin), None, None, None, None, 0, ctypes.byref(blobout)
         )
+        if not ok or blobout.cbData == 0:
+            log.info(f"Cookie '{name}': DPAPI failed (ok={ok} cbData={blobout.cbData})")
+            return ""
         result = ctypes.string_at(blobout.pbData, blobout.cbData)
         ctypes.windll.kernel32.LocalFree(blobout.pbData)
-        return result.decode("utf-8", errors="replace")
+        try:
+            val = result.decode("utf-8")
+            if '�' in val:
+                log.warning(f"Cookie '{name}': DPAPI produced replacement chars (not DPAPI data?)")
+                return ""
+            return val
+        except UnicodeDecodeError:
+            log.warning(f"Cookie '{name}': DPAPI ok but UTF-8 decode failed len={len(result)}")
+            return ""
     except Exception as e:
         log.debug(f"DPAPI decrypt error: {e}")
         return ""
@@ -246,7 +277,7 @@ def get_cookies_for_domain(domain: str = ".eopp.epd-portal.ru") -> dict:
                 plain = row["value"] or ""
 
                 if raw:
-                    decrypted = _decrypt_cookie_value(raw, key)
+                    decrypted = _decrypt_cookie_value(raw, key, name)
                     if decrypted:
                         plain = decrypted
 
